@@ -1,0 +1,17 @@
+[build-system]
+
+requires = ["hatchling>=1.20.0", "hatch-vcs", "hatch-fancy-pypi-readme"]
+build-backend = "hatchling.build"
+
+[project]
+
+name = "dupligator_thomedes"
+description = "Another Python duplicate files finder and processor."
+readme = "README.md"
+license = { text = "GPL v3" }
+requires-python = ">=3.8"
+authors = [{ name = "Toni Homedes i Saun", email = "toni@homedes.net" }]
+dynamic = ["version"]
+
+[tool.black]
+line-length = 79

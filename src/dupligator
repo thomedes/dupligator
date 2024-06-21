@@ -1,0 +1,397 @@
+#! /usr/bin/env python3
+# ------------------------------------------------------------------------------
+"""
+dupygator - Another Python duplicate files finder and processor.
+Copyright (C) 2024  Toni Homedes i Saun
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the
+Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+General Public License for more details.
+
+You should have received a copy of the GNU General Public License along
+with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""
+# ------------------------------------------------------------------------------
+# pylint: disable=[C0103 C0116 R0903 R1702]
+
+import argparse
+import os
+import struct
+import sys
+import hashlib
+
+from locale import LC_ALL, format_string, setlocale
+from pathlib import Path
+from typing import Any, Callable, Generator, Iterable, Optional, Set
+
+
+VER_MAJOR = 0
+VER_MINOR = 0
+VER_PATCH = 0
+VER_IDENTIFIERS = None  # one of None, "alpha", "beta", "rc"
+VER_IDENTIFIERS_N = None  # int or None
+VER_POST_N = None  # int or None
+VER_DEV_N = 0  # int or None
+
+__version__ = (
+    f"{VER_MAJOR}.{VER_MINOR}.{VER_PATCH}"
+    + ("a" if VER_IDENTIFIERS == "alpha" else "")
+    + ("b" if VER_IDENTIFIERS == "beta" else "")
+    + ("rc" if VER_IDENTIFIERS == "rc" else "")
+    + (f".post{VER_POST_N}" if VER_POST_N is not None else "")
+    + (f".dev{VER_DEV_N}" if VER_DEV_N is not None else "")
+)
+
+print(__version__)
+sys.exit(1)
+
+
+def hr_int(value: int):
+    """human readable int"""
+    return format_string("%d", value, grouping=True)
+
+
+class Env:
+    """global state"""
+
+    bits = 8 * struct.calcsize("P")
+    digest = "blake2b" if 8 * struct.calcsize("P") >= 64 else "blake2s"
+    head_size = 32768
+
+    args: argparse.Namespace
+
+    # statistics
+    total_files = 0
+    total_size = 0
+    disc_d = 0
+    disc_f_uniq_size = 0
+    disc_f_uniq_head_hash = 0
+    disc_f_uniq_hash = 0
+    total_sizes = 0
+    total_hashes = 0
+
+    @staticmethod
+    def _print_stat(title: str, value: int) -> None:
+        print(f"{title + ':':24s}{hr_int(value):>8}")
+
+    def show_stats(self):
+        print()
+        Env._print_stat("Discrd. directories", self.disc_d)
+        Env._print_stat("Total files", self.total_files)
+        Env._print_stat("Discrd. by size", self.disc_f_uniq_size)
+        Env._print_stat("Discrd. by head hash", self.disc_f_uniq_head_hash)
+        Env._print_stat("Discrd. by hash", self.disc_f_uniq_hash)
+        Env._print_stat("Total sizes", self.total_sizes)
+        Env._print_stat("Total hashes", self.total_hashes)
+
+
+ScannedDirsList = dict[tuple[int, int], str]
+
+
+def _info(env: Env, level: int, msg: str) -> None:
+    if env.args.verbosity >= level:
+        print(msg)
+
+
+def _error(rc: int, msg: str):
+    print(msg, file=sys.stderr)
+    sys.exit(rc)
+
+
+class Dir:
+    """Represent a directory and get required values from it"""
+
+    def __init__(self, env: Env, path: Path):
+        self._env = env
+        self._path = path
+
+    @property
+    def is_empty(self) -> bool:
+        return False
+
+    @property
+    def is_reference(self) -> bool:
+        return True
+
+    def __lt__(self, other) -> bool:
+        return self._path < other._path
+
+    # def __le__(self, other) -> bool:
+    #     return self._path <= other._path
+
+    # def __eq__(self, other) -> bool:
+    #     return self._path == other._path
+
+    # def __ne__(self, other) -> bool:
+    #     return self._path != other._path
+
+    # def __gt__(self, other) -> bool:
+    #     return self._path > other._path
+
+    # def __ge__(self, other) -> bool:
+    #     return self._path >= other._path
+
+    # def __hash__(self) -> int:
+    #     return hash(self._path)
+
+
+class File:
+    """Represent a file and get required values from it"""
+
+    def __init__(self, env: Env, f: os.DirEntry, reference: bool):
+        self._env = env
+        self._de = f
+        self._reference = reference
+        self._stat = os.stat(self.path)
+        self._head_hash: Optional[bytes] = None
+        self._hash: Optional[bytes] = None
+
+    @property
+    def head_hash(self) -> Optional[bytes]:
+        if self._head_hash is None:
+            try:
+                with open(self.path, "rb") as fin:
+                    h = hashlib.new(
+                        self._env.digest, fin.read(self._env.head_size)
+                    ).digest()
+                    self._head_hash = h
+            except (OSError, PermissionError) as error:
+                print(
+                    f'Error opening "{self.path}": ' + error.strerror,
+                    file=sys.stderr,
+                )
+        return self._head_hash
+
+    @property
+    def hash(self) -> Optional[bytes]:
+        if self._hash is None:
+            if self.size <= self._env.head_size:
+                self._hash = self.head_hash
+            else:
+                try:
+                    with open(self.path, "rb") as fin:
+                        self._hash = hashlib.file_digest(
+                            fin, self._env.digest
+                        ).digest()
+                except (OSError, PermissionError) as error:
+                    print(
+                        f'Error opening "{self.path}": ' + error.strerror,
+                        file=sys.stderr,
+                    )
+        return self._hash
+
+    @property
+    def is_reference(self) -> bool:
+        return self._reference
+
+    @property
+    def path(self) -> str:
+        return self._de.path
+
+    @property
+    def size(self) -> int:
+        return self._stat.st_size
+
+
+def _find_scan(
+    env: Env,
+    directory,
+    reference: bool,
+    scanned_dirs: ScannedDirsList,
+) -> Generator[File, None, None]:
+    """Aux function for _find()
+
+    Processes a directory and all entries in it
+    Uses ScannedDirsList to make sure no directory is scanned twice,
+    even if they have different real_path (think mount -o bind ...)
+    """
+
+    try:
+        real_path = os.path.realpath(directory, strict=True)
+    except OSError as e:
+        _error(1, f'Can\'t resolve real path for "{directory}": {e}')
+
+    sr = os.stat(directory)
+    devino = (sr.st_dev, sr.st_ino)
+
+    if devino in scanned_dirs:  # Must not repeat it
+        env.disc_d += 1
+        return
+
+    scanned_dirs[devino] = directory
+
+    try:
+        for f in os.scandir(real_path):
+            if f.is_file():
+                yield File(env, f, reference)
+            elif f.is_dir(follow_symlinks=env.args.follow_symlinks):
+                yield from _find_scan(env, f.path, reference, scanned_dirs)
+    except OSError as error:
+        _error(1, f'Error scanning "{f}": ' + error.strerror)
+
+
+def _find(env: Env, references, dirs) -> Generator[File, None, None]:
+    """Returns a list of DupCandidates"""
+
+    scanned_dirs: ScannedDirsList = {}
+
+    for d in references:
+        yield from _find_scan(env, d, True, scanned_dirs)
+
+    for d in dirs:
+        yield from _find_scan(env, d, False, scanned_dirs)
+
+
+def _group_by(src: Iterable[Any], key: Callable[[Any], Any]):
+    """Group elements in src by given key
+
+    src is not guaranteed to be iterable multiple times, so everything
+    must be done in a single pass
+    """
+
+    groups = {}
+    for element in src:
+        grouping_value = key(element)
+
+        if grouping_value not in groups:
+            groups[grouping_value] = [element]
+        else:
+            groups[grouping_value].append(element)
+
+    return groups
+
+
+def _delete_empty_dirs(env: Env, dirs: Iterable[Dir]) -> None:
+    """Delete empty dirs in input.
+
+    Recurses back down to the starting dirs.
+    """
+    for d in reversed(sorted(dirs)):
+        if d.is_empty and not d.is_reference:
+            _info(env, 1, f"Removing {d}")
+
+
+def _process_files(env: Env, files: Iterable[File]) -> None:
+
+    affected_dirs: Set[Dir] = set()
+
+    files_by_size = _group_by(files, lambda f: f.size)
+    for size in sorted(files_by_size.keys()):
+        env.total_sizes += 1
+        same_size_files = files_by_size[size]
+        env.total_files += len(same_size_files)
+
+        if len(same_size_files) < 2:
+            env.disc_f_uniq_size += 1
+            continue  # Discard files with unique sizes
+
+        # print(format_string("%d", size, grouping=True))
+
+        files_by_head_hash = _group_by(same_size_files, lambda f: f.head_hash)
+        for _, same_hh_files in files_by_head_hash.items():
+            if len(same_hh_files) < 2:
+                env.disc_f_uniq_head_hash += 1
+                continue  # Discard files with unique head hash
+
+            files_by_hash = _group_by(same_hh_files, lambda f: f.hash)
+            for _, same_hash_files in files_by_hash.items():
+                env.total_hashes += 1
+                if len(same_hash_files) < 2:
+                    env.disc_f_uniq_hash += 1
+                    continue  # Discard files with unique hash
+
+                # Here we have a group of files of same size and hash.
+                # We need to discard the first (the one to be saved)
+                # and any posible references following it.
+
+                for i, f in enumerate(same_hash_files):
+                    if i == 0 or f.is_reference:
+                        _info(env, 1, f"Keeping  {f.path}")
+                    else:
+                        _info(env, 1, f"Deleting {f.path}")
+                        if not env.args.dry_run:
+                            pass  # os.remove(f.path)
+                        affected_dirs.add(Dir(env, f.path))
+
+    if not env.args.keep_empty_directories:
+        _delete_empty_dirs(env, affected_dirs)
+
+
+def _check_type_dir(path: str) -> Path:
+    """Aux function for _parse_args()"""
+
+    p = Path(path)
+    if not p.is_dir():
+        raise argparse.ArgumentTypeError(f"'{path}' is not a directory!")
+    return p
+
+
+def _parse_args(argv) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        "pdfind", description="Find and optionally delete duplicate files"
+    )
+    parser.add_argument(
+        "-v",
+        "--verbosity",
+        action="count",
+        help="increase output verbosity",
+        default=0,
+    )
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="count",
+        help="Dry run. Don't actually erase any files.",
+        default=0,
+    )
+    parser.add_argument(
+        "-L", "--follow-symlinks", action="store_true", help="Follow symlinks."
+    )
+    parser.add_argument(
+        "-k",
+        "--keep-empty-directories",
+        action="store_true",
+        help="Keep emptied directories.",
+    )
+    parser.add_argument(
+        "-r",
+        "--reference-path",
+        type=_check_type_dir,
+        action="append",
+        help="Files here will be used to look for duplicates"
+        + " but fill NEVER be deleted or modified in any way",
+        default=[],
+    )
+    parser.add_argument(
+        "dirs", nargs="*", type=_check_type_dir, action="store"
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv) -> int:
+    setlocale(LC_ALL, "")
+
+    env = Env()
+    env.args = _parse_args(argv[1:])
+
+    if env.args.dry_run:
+        print("DRY RUN!")
+
+    _info(env, 2, str(env.args))
+
+    _process_files(env, _find(env, env.args.reference_path, env.args.dirs))
+
+    if env.args.verbosity > 0:
+        env.show_stats()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
